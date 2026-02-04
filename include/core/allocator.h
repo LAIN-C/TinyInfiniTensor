@@ -23,10 +23,22 @@ namespace infini {
     // pointer to the memory actually allocated
     void *ptr;
 
+    // Current simulated heap end (i.e., the first unallocated address offset).
+    // This can move backward when the last block is freed.
+    size_t heapEnd;
+
     // =================================== 作业 ===================================
     // TODO：可能需要设计一个数据结构来存储free block，以便于管理和合并
     // HINT: 可以使用一个 map 来存储 free block，key 为 block 的起始/结尾地址，value 为 block 的大小
+    //
+    // We keep two indices to support fast coalescing:
+    // - freeBlocksByAddr: start -> size
+    // - freeBlocksByEnd : end   -> start
+    //
+    // NOTE: All offsets/sizes are aligned by `alignment`.
     // =================================== 作业 ===================================
+    std::map<size_t, size_t> freeBlocksByAddr;
+    std::map<size_t, size_t> freeBlocksByEnd;
 
   public:
     Allocator(Runtime runtime);

@@ -1,7 +1,12 @@
 #include "core/graph.h"
+#include "core/blob.h"
+#include "operators/matmul.h"
+#include "operators/transpose.h"
 #include <algorithm>
 #include <numeric>
 #include <queue>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace infini
 {
@@ -106,6 +111,175 @@ namespace infini
         // 1. 去除冗余的算子（例如，两个相邻的算子都是 transpose 算子，且做的是相反的操作，可以将其全部删除）
         // 2. 合并算子（例如，矩阵乘算子中含有属性transA、transB，如果其输入存在transpose，且对最后两个维度做交换，就可以将transpose融入到矩阵乘算子的属性中去）
         // =================================== 作业 ===================================
+
+        // The tests expect two kinds of optimizations:
+        // 1) Transpose + Transpose cancellation when they are consecutive and
+        //    their permutations are inverse of each other.
+        // 2) Fuse a "swap-last-two-dims" Transpose into Matmul's transA/transB.
+        //
+        // Implementation note:
+        // We only mutate operator input tensors and then *rebuild* all
+        // graph connections (tensor source/targets, op pred/succ) to keep the
+        // internal structure consistent.
+
+        IT_ASSERT(topo_sort() == true);
+
+        auto isInversePermute = [](const std::vector<int> &p,
+                                   const std::vector<int> &q) -> bool
+        {
+            if (p.size() != q.size())
+                return false;
+            const int rank = static_cast<int>(p.size());
+            std::vector<int> inv(rank, -1);
+            for (int i = 0; i < rank; ++i)
+            {
+                IT_ASSERT(p[i] >= 0 && p[i] < rank);
+                inv[p[i]] = i;
+            }
+            return inv == q;
+        };
+
+        auto isSwapLastTwoDims = [](const std::vector<int> &perm) -> bool
+        {
+            const int rank = static_cast<int>(perm.size());
+            if (rank < 2)
+                return false;
+            for (int i = 0; i < rank - 2; ++i)
+                if (perm[i] != i)
+                    return false;
+            return perm[rank - 2] == rank - 1 && perm[rank - 1] == rank - 2;
+        };
+
+        // Producer map: output tensor -> operator
+        std::unordered_map<TensorObj *, Operator> producer;
+        producer.reserve(tensors.size());
+        for (auto &op : ops)
+            for (auto &out : op->getOutputs())
+                producer[out.get()] = op;
+
+        std::unordered_set<OperatorObj *> removeOps;
+        std::unordered_set<TensorObj *> removeTensors;
+
+        // -------- Rule 1: cancel adjacent transpose pairs --------
+        for (size_t i = 0; i + 1 < ops.size(); ++i)
+        {
+            auto t1 = as<TransposeObj>(ops[i]);
+            auto t2 = as<TransposeObj>(ops[i + 1]);
+            if (!t1 || !t2)
+                continue;
+
+            auto t1Out = t1->getOutput(0);
+            auto t2In = t2->getInputs(0);
+            if (t1Out != t2In)
+                continue;
+
+            const auto p1 = t1->getPermute();
+            const auto p2 = t2->getPermute();
+            if (!isInversePermute(p1, p2))
+                continue;
+
+            // Replace uses of t2's output by t1's input.
+            auto src = t1->getInputs(0);
+            auto dst = t2->getOutput(0);
+            for (auto &op : ops)
+            {
+                if (removeOps.count(op.get()))
+                    continue;
+                op->replaceInput(dst, src);
+            }
+
+            removeOps.insert(t1.get());
+            removeOps.insert(t2.get());
+            removeTensors.insert(t1Out.get());
+            removeTensors.insert(dst.get());
+        }
+
+        // -------- Rule 2: fuse transpose into matmul transA/transB --------
+        for (auto &op : ops)
+        {
+            if (removeOps.count(op.get()))
+                continue;
+
+            auto mm = as<MatmulObj>(op);
+            if (!mm)
+                continue;
+
+            for (int inputIdx = 0; inputIdx < 2; ++inputIdx)
+            {
+                auto inputTensor = mm->getInputs(inputIdx);
+                auto itProd = producer.find(inputTensor.get());
+                if (itProd == producer.end())
+                    continue;
+                if (removeOps.count(itProd->second.get()))
+                    continue;
+
+                auto tp = as<TransposeObj>(itProd->second);
+                if (!tp)
+                    continue;
+
+                const auto perm = tp->getPermute();
+                if (!isSwapLastTwoDims(perm))
+                    continue;
+
+                // Fuse: remove transpose by toggling the corresponding flag.
+                // Example: Matmul(transpose(A), B) == Matmul(A, B, transA=true)
+                auto original = tp->getInputs(0);
+                mm->replaceInput(inputTensor, original);
+                if (inputIdx == 0)
+                    mm->setTransA(!mm->getTransA());
+                else
+                    mm->setTransB(!mm->getTransB());
+
+                removeOps.insert(tp.get());
+                removeTensors.insert(tp->getOutput(0).get());
+            }
+        }
+
+        // -------- Materialize removals & prune unused tensors --------
+        OpVec newOps;
+        newOps.reserve(ops.size());
+        for (auto &op : ops)
+            if (!removeOps.count(op.get()))
+                newOps.emplace_back(op);
+
+        // Collect tensors that are still referenced by remaining ops.
+        std::unordered_set<TensorObj *> usedTensorPtrs;
+        usedTensorPtrs.reserve(tensors.size());
+        for (auto &op : newOps)
+        {
+            for (auto &t : op->getInputs())
+                usedTensorPtrs.insert(t.get());
+            for (auto &t : op->getOutputs())
+                usedTensorPtrs.insert(t.get());
+        }
+
+        TensorVec newTensors;
+        newTensors.reserve(tensors.size());
+        for (auto &t : tensors)
+        {
+            if (removeTensors.count(t.get()))
+                continue;
+            if (usedTensorPtrs.count(t.get()))
+                newTensors.emplace_back(t);
+        }
+
+        // -------- Rebuild all graph connections --------
+        tensors = std::move(newTensors);
+        for (auto &t : tensors)
+        {
+            t->targets.clear();
+            t->source.reset();
+        }
+        for (auto &op : newOps)
+        {
+            op->predecessors.clear();
+            op->successors.clear();
+        }
+
+        ops.clear();
+        sorted = false;
+        for (auto &op : newOps)
+            addOperatorAndConnect(op);
     }
 
     Tensor GraphObj::getTensor(int fuid) const
@@ -152,6 +326,68 @@ namespace infini
         // TODO：利用 allocator 给计算图分配内存
         // HINT: 获取分配好的内存指针后，可以调用 tensor 的 setDataBlob 函数给 tensor 绑定内存
         // =================================== 作业 ===================================
+
+        // We perform a simple lifetime-based memory planning:
+        // - Graph input tensors must be allocated first so users can setData().
+        // - As we traverse operators in topological order, we allocate outputs.
+        // - We free an input tensor when it has been consumed by all its target
+        //   operators (i.e., its last use), which enables memory reuse.
+        //
+        // Note: Tensors that are graph outputs (no targets) are never freed.
+
+        std::unordered_map<TensorObj *, int> remainingUses;
+        remainingUses.reserve(tensors.size());
+        for (auto &t : tensors)
+            remainingUses.emplace(t.get(), (int)t->getTargets().size());
+
+        std::unordered_set<TensorObj *> keepAlive;
+        for (auto &t : getOutputs())
+            keepAlive.insert(t.get());
+
+        std::unordered_map<TensorObj *, size_t> offsets;
+        offsets.reserve(tensors.size());
+
+        auto allocTensorIfNeeded = [&](const Tensor &t)
+        {
+            if (!t)
+                return;
+            if (offsets.find(t.get()) != offsets.end())
+                return;
+            offsets.emplace(t.get(), allocator.alloc(t->getBytes()));
+        };
+
+        // Allocate all graph inputs first (no source operator).
+        for (auto &t : tensors)
+            if (!t->getSource())
+                allocTensorIfNeeded(t);
+
+        // Allocate outputs and release dead inputs.
+        for (auto &op : ops)
+        {
+            for (auto &out : op->getOutputs())
+                allocTensorIfNeeded(out);
+
+            for (auto &in : op->getInputs())
+            {
+                auto it = remainingUses.find(in.get());
+                IT_ASSERT(it != remainingUses.end());
+                it->second -= 1;
+                if (it->second == 0 && keepAlive.count(in.get()) == 0)
+                {
+                    allocator.free(offsets.at(in.get()), in->getBytes());
+                }
+            }
+        }
+
+        // Perform one real allocation and bind each tensor to its planned offset.
+        void *base = allocator.getPtr();
+        for (auto &t : tensors)
+        {
+            auto it = offsets.find(t.get());
+            IT_ASSERT(it != offsets.end(), "Tensor missing memory plan");
+            auto ptr = static_cast<void *>(static_cast<char *>(base) + it->second);
+            t->setDataBlob(make_ref<BlobObj>(runtime, ptr));
+        }
 
         allocator.info();
     }

@@ -9,10 +9,12 @@ namespace infini
         auto rank = input->getRank();
         if (permute.empty())
         {
+            // Default behavior in this project: identity permutation.
+            // (Some frameworks default to reversing dims, but here we keep
+            // existing semantics and make it safe by resizing the vector.)
+            transposePermute.resize(rank);
             for (size_t i = 0; i < rank; ++i)
-            {
-                transposePermute[i] = i;
-            }
+                transposePermute[i] = (int)i;
         }
         else
         {
@@ -34,7 +36,16 @@ namespace infini
         // REF: https://onnx.ai/onnx/operators/onnx__Transpose.html#transpose-21
         // =================================== 作业 ===================================
 
-        return std::nullopt;
+        IT_ASSERT((int)transposePermute.size() == rank);
+        // ONNX-style permutation: output[i] = input[perm[i]].
+        for (int i = 0; i < rank; ++i)
+        {
+            const int srcAxis = transposePermute[i];
+            IT_ASSERT(srcAxis >= 0 && srcAxis < rank);
+            output_dim[i] = input_dim[srcAxis];
+        }
+
+        return {{output_dim}};
     }
 
     std::string TransposeObj::toString() const
